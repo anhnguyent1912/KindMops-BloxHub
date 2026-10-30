@@ -11,7 +11,7 @@ local LP = Players.LocalPlayer
 local env = (type(getgenv) == 'function' and getgenv()) or _G
 if type(env.KindMopsHubStop) == 'function' then pcall(env.KindMopsHubStop) end
 local CFG = {
-    Title = 'KINDMOPS | BLOX HUB V1',
+    Title = 'KINDMOPS | V1.2 QUEST FIX',
     UpdateSeconds = 0.25,
     MoveSpeed = 190,
     MoveHeight = 14,
@@ -38,6 +38,9 @@ local statRequestInFlight = false
 local toggleButtons = {}
 local questChoice, questReady = nil, false
 local questMessage = 'Quest: OFF'
+local attackMessage = 'Attack: OFF'
+local pendingQuest, ownedQuestSignature = nil, nil
+local restartQuestRequested, restartWaitingAt = false, nil
 local lastQuestAttempt = -math.huge
 local automationGeneration = 0
 local lastActivatedTool = nil
@@ -55,6 +58,7 @@ local function setFlag(key,value)
  if key=='AutoQuest' then
   automationGeneration=automationGeneration+1
   questChoice=nil; questReady=false
+  pendingQuest=nil; ownedQuestSignature=nil; restartQuestRequested=false; restartWaitingAt=nil
   questMessage=value and 'Quest: reading game data...' or 'Quest: OFF'
   stopMovement(); releaseAttack()
  elseif key=='AutoApproach' and not value then stopMovement()
@@ -123,7 +127,7 @@ local function nearestEnemy()
  local folder=workspace:FindFirstChild('Enemies'); local root=getRoot()
  if not folder or not root then return nil end
  if Flags.AutoQuest and (not questReady or not questChoice) then return nil end
- local best,dist=nil,CFG.TargetRange
+ local best,dist=nil,(Flags.AutoQuest and math.huge or CFG.TargetRange)
  for _,mob in ipairs(folder:GetChildren()) do
   local hum=mob:FindFirstChildOfClass('Humanoid'); local part=mob:FindFirstChild('HumanoidRootPart')
   if hum and part and hum.Health>0 and (not Flags.AutoQuest or cleanEnemyName(mob.Name)==questChoice.Enemy) then
@@ -151,6 +155,15 @@ addButton('MAIN','Auto farm: start / stop',function()
  setFlag('AutoApproach',enabled); setFlag('AutoQuest',enabled)
 end)
 local questStatus=addButton('MAIN','Quest: OFF',function(b) b.Text=questMessage end)
+questStatus.Size=UDim2.new(1,-4,0,54); questStatus.TextWrapped=true
+local attackStatus=addButton('MAIN','Attack: OFF',function(b) b.Text=attackMessage end)
+attackStatus.Size=UDim2.new(1,-4,0,54); attackStatus.TextWrapped=true
+addButton('MAIN','Restart level quest (clears current progress)',function()
+ if not Flags.AutoQuest then setFlag('AutoQuest',true) end
+ restartQuestRequested=true
+ questReady=false; stopMovement(); releaseAttack()
+ questMessage='Quest: restarting current level quest...'
+end)
 addButton('MAIN','Choose weapon: tap to cycle',function(b)
  local options={}; local bag=LP:FindFirstChild('Backpack')
  for _,folder in ipairs({bag,LP.Character}) do
@@ -309,6 +322,26 @@ end
 local function titleMatches(title,quest)
  return title:lower():find(quest.Enemy:lower(),1,true)~=nil
 end
+local function questSignature(title)
+ -- The objective text stays the same as translated progress counters change.
+ return (title:gsub('%b<>',''):gsub('%d+',''):gsub('%s+',' '):gsub('^%s+',''):gsub('%s+$',''))
+end
+local function ownedQuestMatches(title)
+ if not questChoice or ownedQuestSignature==nil then return false end
+ local signature=questSignature(title)
+ if signature=='' then return false end
+ if ownedQuestSignature=='' then ownedQuestSignature=signature end
+ return signature==ownedQuestSignature
+end
+local function adoptPendingQuest(title,generation)
+ if pendingQuest and pendingQuest.Generation==generation and os.clock()-pendingQuest.At<=15 then
+  questChoice=pendingQuest.Choice
+  ownedQuestSignature=questSignature(title)
+  pendingQuest=nil
+  return true
+ end
+ return false
+end
 local function chooseQuest(list,level,title)
  local team=LP.Team and LP.Team.Name or ''
  for _,entry in ipairs(list) do
@@ -347,7 +380,7 @@ local function findSpawn(enemy)
  if replicated then table.insert(folders,replicated) end
  local best,bestDistance=nil,math.huge
  for _,folder in ipairs(folders) do
-  for _,point in ipairs(folder:GetChildren()) do
+  for _,point in ipairs(folder:GetDescendants()) do
    if cleanEnemyName(point.Name)==enemy then
     local position=nil
     if point:IsA('BasePart') then position=point.Position
@@ -390,16 +423,31 @@ local function ensureWeapon()
 end
 local function attack()
  releaseAttack()
- if not alive or not Flags.AutoAttack or not livingRoot() then return end
+ if not alive or not Flags.AutoAttack then attackMessage='Attack: OFF'; return end
+ if not livingRoot() then attackMessage='Attack: waiting for character'; return end
  if Flags.AutoQuest then
   local visible,title=readQuestPanel()
-  if not visible or not questReady or not questChoice or not titleMatches(title,questChoice) then return end
+  if not visible or not questReady or not questChoice then
+   attackMessage='Attack: waiting for quest / target'; return
+  end
+  if not ownedQuestMatches(title) and not titleMatches(title,questChoice) then
+   attackMessage='Attack: quest not recognized; use Restart level quest'; return
+  end
  end
  local enemy,distance=nearestEnemy()
- if not enemy or distance>CFG.AttackRange then return end
+ if not enemy then
+  attackMessage='Attack: no loaded '..(questChoice and questChoice.Enemy or 'enemy'); return
+ end
+ if distance>CFG.AttackRange then
+  attackMessage=string.format('Attack: %s is %.0f studs away%s',enemy.Name,distance,Flags.AutoApproach and '' or '; turn on Approach')
+  return
+ end
  local tool=ensureWeapon()
- if not tool then questMessage='Attack: choose a melee weapon or sword'; return end
- if tool.Enabled then lastActivatedTool=tool; tool:Activate() end
+ if not tool then attackMessage='Attack: choose a melee weapon or sword'; return end
+ if not tool.Enabled then attackMessage='Attack: weapon cooldown'; return end
+ lastActivatedTool=tool
+ tool:Activate()
+ attackMessage='Attack: activating '..tool.Name..' on '..enemy.Name
 end
 local function updateQuest(generation)
  questReady=false
@@ -411,20 +459,46 @@ local function updateQuest(generation)
  if not level then stopMovement(); questMessage='Quest: waiting for level'; return end
  local visible,title=readQuestPanel()
  if visible==nil then stopMovement(); questMessage='Quest: panel unavailable'; return end
+ if restartQuestRequested then
+  restartQuestRequested=false; questChoice=nil; pendingQuest=nil; ownedQuestSignature=nil
+  stopMovement(); releaseAttack()
+  if visible then
+   local remotes=ReplicatedStorage:FindFirstChild('Remotes')
+   local remote=remotes and remotes:FindFirstChild('CommF_')
+   if not remote or not remote:IsA('RemoteFunction') then questMessage='Quest: restart remote unavailable'; return end
+   restartWaitingAt=os.clock()
+   local ok=pcall(function() remote:InvokeServer('AbandonQuest') end)
+   if not alive or not Flags.AutoQuest or generation~=automationGeneration then return end
+   if not ok then restartWaitingAt=nil; questMessage='Quest: restart failed; press Restart again' end
+   return
+  end
+ end
+ if restartWaitingAt then
+  if not visible then restartWaitingAt=nil; lastQuestAttempt=-math.huge
+  elseif os.clock()-restartWaitingAt<5 then questMessage='Quest: waiting for old quest to close'; return
+  else restartWaitingAt=nil; questMessage='Quest: restart not confirmed; press Restart again'; return end
+ end
  if visible then
-  if not questChoice or not titleMatches(title,questChoice) then questChoice=chooseQuest(list,level,title) end
-  if not questChoice then stopMovement(); questMessage='Quest: finish/cancel current unsupported quest'; return end
+  adoptPendingQuest(title,generation)
+  if not ownedQuestMatches(title) and (not questChoice or not titleMatches(title,questChoice)) then
+   ownedQuestSignature=nil
+   questChoice=chooseQuest(list,level,title)
+  end
+  if not questChoice then
+   stopMovement(); questMessage='Quest: cannot identify existing quest. Press Restart level quest.'; return
+  end
   questReady=true
   questMessage=string.format('%s | Lv.%d | %s',CFG.PlaceIds[game.PlaceId],level,questChoice.Enemy)
   if Flags.AutoApproach then
    if not approach() then
     local spawnPosition=findSpawn(questChoice.Enemy)
     if spawnPosition then moveTo(spawnPosition+Vector3.new(0,3,0),5)
-    else questMessage='Quest: waiting for '..questChoice.Enemy..' to load' end
+    else questMessage='Quest accepted: '..questChoice.Enemy..'; no enemy/spawn loaded. Move toward the enemy area.' end
    end
   end
   return
  end
+ ownedQuestSignature=nil
  questChoice=chooseQuest(list,level)
  if not questChoice then stopMovement(); questMessage='Quest: no eligible mission at this level'; return end
  questMessage=string.format('Quest: %s (Lv.%d) - going to NPC',questChoice.Enemy,questChoice.Level)
@@ -434,8 +508,11 @@ local function updateQuest(generation)
  local remote=remotes and remotes:FindFirstChild('CommF_')
  if not remote or not remote:IsA('RemoteFunction') then questMessage='Quest: server remote unavailable'; return end
  lastQuestAttempt=os.clock()
- local ok=pcall(function() remote:InvokeServer('StartQuest',questChoice.Id,questChoice.Index) end)
+ local requestChoice=questChoice
+ pendingQuest={Choice=requestChoice,Generation=generation,At=os.clock()}
+ local ok=pcall(function() remote:InvokeServer('StartQuest',requestChoice.Id,requestChoice.Index) end)
  if not alive or not Flags.AutoQuest or generation~=automationGeneration then return end
+ if not ok then pendingQuest=nil end
  questMessage=ok and 'Quest: waiting for acceptance' or 'Quest: request failed; retrying'
 end
 -- A single worker owns quest requests. A slow server cannot enqueue duplicates.
@@ -447,7 +524,7 @@ bind(RunService.Heartbeat,function(dt)
  if attackElapsed>=CFG.AttackSeconds then
   attackElapsed=0
   local ok,err=pcall(attack)
-  if not ok then releaseAttack(); questMessage='Attack error: '..tostring(err) end
+  if not ok then releaseAttack(); attackMessage='Attack error: '..tostring(err) end
  end
  if questElapsed>=.5 then
   questElapsed=0
@@ -477,6 +554,7 @@ bind(RunService.Heartbeat,function(dt)
   local r=getRoot(); coords.Text=r and string.format('Position: %.0f, %.0f, %.0f',r.Position.X,r.Position.Y,r.Position.Z) or 'Position: unavailable'
   local mob,d=nearestEnemy(); status.Text=mob and string.format('Nearest enemy: %s (%.0f)',mob.Name,d) or 'Nearest enemy: none'
   questStatus.Text=questMessage
+  attackStatus.Text=attackMessage
   if Flags.AutoEquip then pcall(equipSelected) end
   footer.Text=(CFG.PlaceIds[game.PlaceId] or 'Unknown sea')..' | '..(LP.Name or '')..' | F4: menu'
  end
@@ -536,4 +614,4 @@ end
 env.KindMopsHubStop=stop
 bind(closeBtn.MouseButton1Click,stop)
 showTab('MAIN')
-print('[KindMops Blox Hub V1] loaded: F4 toggle; close to unload')
+print('[KindMops V1.2 Quest Fix] loaded: F4 toggle; close to unload')
