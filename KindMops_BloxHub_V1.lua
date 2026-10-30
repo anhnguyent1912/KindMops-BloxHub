@@ -11,7 +11,7 @@ local LP = Players.LocalPlayer
 local env = (type(getgenv) == 'function' and getgenv()) or _G
 if type(env.KindMopsHubStop) == 'function' then pcall(env.KindMopsHubStop) end
 local CFG = {
-    Title = 'KINDMOPS | V1.2 QUEST FIX',
+    Title = 'KINDMOPS | V1.3 TRACKER FIX',
     UpdateSeconds = 0.25,
     MoveSpeed = 190,
     MoveHeight = 14,
@@ -307,17 +307,107 @@ local function playerLevel()
  local data=LP:FindFirstChild('Data'); local level=data and data:FindFirstChild('Level')
  return level and tonumber(level.Value)
 end
+-- Find the rendered tracker instead of treating a hidden legacy frame as authoritative.
+local questUiPath='not detected'
+local function isRendered(object,playerGui)
+ local current=object
+ while current and current~=playerGui do
+  if current==gui or current.Name=='KindMops_BloxHub' then return false end
+  if current:IsA('GuiObject') and not current.Visible then return false end
+  if current:IsA('ScreenGui') and not current.Enabled then return false end
+  if current:IsA('CanvasGroup') and current.GroupTransparency>=1 then return false end
+  current=current.Parent
+ end
+ return current==playerGui
+end
+local function labelText(object)
+ if not object:IsA('TextLabel') and not object:IsA('TextButton') then return nil end
+ if object.TextTransparency>=1 then return nil end
+ return (object.Text:gsub('%b<>',''))
+end
+local function objectiveText(text)
+ local lower=text:lower()
+ return lower:find('defeat',1,true) or lower:find('kill ',1,true)
+   or text:find('Đánh bại',1,true) or text:find('đánh bại',1,true)
+end
+local function inspectQuestScope(scope,playerGui)
+ local rows={}
+ local namedTitle=nil
+ for _,label in ipairs(scope:GetDescendants()) do
+  local text=labelText(label)
+  if text and text~='' and isRendered(label,playerGui) then
+   if objectiveText(text) then rows[#rows+1]=text end
+   local name=label.Name:lower()
+   if not namedTitle and (name=='title' or name=='questtitle' or name=='objective')
+      and text:find('%a') then namedTitle=text end
+  end
+ end
+ table.sort(rows)
+ if #rows>0 then return table.concat(rows,' | '),true end
+ local name=scope.Name:lower()
+ if namedTitle and (name:find('quest',1,true) or name:find('mission',1,true)) then return namedTitle,true end
+ return nil,false
+end
 local function readQuestPanel()
  local playerGui=LP:FindFirstChild('PlayerGui')
- local mainGui=playerGui and playerGui:FindFirstChild('Main')
- local panelGui=mainGui and mainGui:FindFirstChild('Quest')
- if not panelGui or not panelGui:IsA('GuiObject') then return nil,'' end
- if not panelGui.Visible then return false,'' end
- local container=panelGui:FindFirstChild('Container')
- local heading=container and container:FindFirstChild('QuestTitle')
- local title=heading and heading:FindFirstChild('Title')
- if title and (title:IsA('TextLabel') or title:IsA('TextButton')) then return true,title.Text end
- return true,''
+ if not playerGui then questUiPath='PlayerGui unavailable'; return nil,'' end
+ local mainGui=playerGui:FindFirstChild('Main')
+ local legacy=mainGui and mainGui:FindFirstChild('Quest')
+ local candidates,seen={},{}
+ -- A progress fraction alone is not sufficient: health/energy/XP also use fractions.
+ -- Require a visible objective in the same card, or a named mission card with a title.
+ for _,label in ipairs(playerGui:GetDescendants()) do
+  local text=labelText(label)
+  if text and isRendered(label,playerGui) then
+   local done,total=text:match('(%d+)%s*/%s*(%d+)')
+   done,total=tonumber(done),tonumber(total)
+   if done and total and total>0 and done<=total then
+    local scope=label.Parent
+    for _=1,5 do
+     if not scope or scope==playerGui or scope:IsA('ScreenGui') then break end
+     local title,valid=inspectQuestScope(scope,playerGui)
+     if valid then
+      local expected=tonumber(title:match('%d+'))
+      if (not expected or expected==total) and not seen[scope] then
+       candidates[#candidates+1]={Scope=scope,Title=title,Count=total}
+       seen[scope]=true
+      end
+      break
+     end
+     scope=scope.Parent
+    end
+   end
+  end
+ end
+ -- Keep the smallest card when a broad HUD container also contains that card.
+ local smallest={}
+ for _,candidate in ipairs(candidates) do
+  local containsCard=false
+  for _,other in ipairs(candidates) do
+   if other~=candidate and other.Scope:IsDescendantOf(candidate.Scope) then containsCard=true; break end
+  end
+  if not containsCard then smallest[#smallest+1]=candidate end
+ end
+ candidates=smallest
+ if #candidates==1 then
+  questUiPath=candidates[1].Scope:GetFullName()
+  return true,candidates[1].Title
+ elseif #candidates>1 then
+  questUiPath='multiple visible quest cards; close quest lists'
+  return nil,''
+ end
+ -- Preserve older layouts that show the title without a text progress counter.
+ if legacy and legacy:IsA('GuiObject') and isRendered(legacy,playerGui) then
+  local container=legacy:FindFirstChild('Container')
+  local heading=container and container:FindFirstChild('QuestTitle')
+  local title=heading and heading:FindFirstChild('Title')
+  local text=title and labelText(title)
+  if text and text~='' and isRendered(title,playerGui) then
+   questUiPath=legacy:GetFullName(); return true,text
+  end
+ end
+ if legacy then questUiPath='no active tracker (legacy hidden)'; return false,'' end
+ questUiPath='tracker layout not recognized'; return nil,''
 end
 local function titleMatches(title,quest)
  return title:lower():find(quest.Enemy:lower(),1,true)~=nil
@@ -458,7 +548,7 @@ local function updateQuest(generation)
  local level=playerLevel()
  if not level then stopMovement(); questMessage='Quest: waiting for level'; return end
  local visible,title=readQuestPanel()
- if visible==nil then stopMovement(); questMessage='Quest: panel unavailable'; return end
+ if visible==nil then stopMovement(); questMessage='Quest UI: '..questUiPath; return end
  if restartQuestRequested then
   restartQuestRequested=false; questChoice=nil; pendingQuest=nil; ownedQuestSignature=nil
   stopMovement(); releaseAttack()
@@ -479,6 +569,7 @@ local function updateQuest(generation)
   else restartWaitingAt=nil; questMessage='Quest: restart not confirmed; press Restart again'; return end
  end
  if visible then
+  if title=='' then stopMovement(); questMessage='Quest: waiting for objective text'; return end
   adoptPendingQuest(title,generation)
   if not ownedQuestMatches(title) and (not questChoice or not titleMatches(title,questChoice)) then
    ownedQuestSignature=nil
@@ -503,7 +594,7 @@ local function updateQuest(generation)
  if not questChoice then stopMovement(); questMessage='Quest: no eligible mission at this level'; return end
  questMessage=string.format('Quest: %s (Lv.%d) - going to NPC',questChoice.Enemy,questChoice.Level)
  if not moveTo(questChoice.Position,4) then return end
- if os.clock()-lastQuestAttempt<CFG.QuestRetrySeconds then questMessage='Quest: waiting for acceptance'; return end
+ if os.clock()-lastQuestAttempt<CFG.QuestRetrySeconds then questMessage='Quest: waiting for tracker | '..questUiPath; return end
  local remotes=ReplicatedStorage:FindFirstChild('Remotes')
  local remote=remotes and remotes:FindFirstChild('CommF_')
  if not remote or not remote:IsA('RemoteFunction') then questMessage='Quest: server remote unavailable'; return end
@@ -512,7 +603,8 @@ local function updateQuest(generation)
  pendingQuest={Choice=requestChoice,Generation=generation,At=os.clock()}
  local ok=pcall(function() remote:InvokeServer('StartQuest',requestChoice.Id,requestChoice.Index) end)
  if not alive or not Flags.AutoQuest or generation~=automationGeneration then return end
- if not ok then pendingQuest=nil end
+ if not ok then pendingQuest=nil
+ elseif pendingQuest then pendingQuest.At=os.clock() end
  questMessage=ok and 'Quest: waiting for acceptance' or 'Quest: request failed; retrying'
 end
 -- A single worker owns quest requests. A slow server cannot enqueue duplicates.
@@ -614,4 +706,4 @@ end
 env.KindMopsHubStop=stop
 bind(closeBtn.MouseButton1Click,stop)
 showTab('MAIN')
-print('[KindMops V1.2 Quest Fix] loaded: F4 toggle; close to unload')
+print('[KindMops V1.3 Tracker Fix] loaded: F4 toggle; close to unload')
